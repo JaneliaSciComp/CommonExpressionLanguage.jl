@@ -1,0 +1,13 @@
+name = "CommonExpressionLanguage"
+uuid = "504a643d-8012-417d-96de-56a510ca6d29"
+authors = ["Ben Arthur <arthurb@hhmi.org>"]
+version = "0.1.0"
+
+[compat]
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
