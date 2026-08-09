@@ -1,22 +1,25 @@
 # A native-Julia evaluator for a subset of the Common Expression Language
 # (CEL, https://cel.dev / github.com/cel-expr/cel-spec).
 #
-# Scope: the practical predicate subset -- literals, identifiers, field
-# selection, indexing, the string methods startsWith/endsWith/contains,
-# `!`, comparisons, and CEL's `&&`/`||` (which are COMMUTATIVE OVER
-# ERRORS, not merely short-circuiting). Everything outside the subset fails to
-# COMPILE with `CELParseError` -- never silently misparses -- so callers
-# can route unsupported expressions to a fail-closed policy.
+# Scope: the practical predicate subset -- literals (including list and
+# map literals), identifiers, field selection, indexing, arithmetic
+# (`+ - * / %` and unary `-`), comparisons, `in`, the ternary
+# `cond ? a : b`, CEL's `&&`/`||` (which are COMMUTATIVE OVER ERRORS,
+# not merely short-circuiting), the string methods
+# startsWith/endsWith/contains/matches, the global functions
+# size/has/string/int/uint/double/matches, and the comprehension macros
+# exists/all/exists_one/filter/map. Everything outside the subset fails
+# to COMPILE with `CELParseError` -- never silently misparses -- so
+# callers can route unsupported expressions to a fail-closed policy.
 #
 # The architecture mirrors the cel-spec pipeline so the rest of the
 # language can land incrementally: lexer -> AST -> tree-walking evaluator
-# over a variable environment. The obvious extension points:
-#   * new binary operators: one entry in the parser's precedence ladder
-#     plus an `_eval_bin` branch (`+ - * / %`, `in`, `? :`);
-#   * list/map literals: two `parse_primary` productions;
-#   * functions and macros (`size`, `has`, `matches`, comprehensions):
-#     dispatch alongside the string-method call route in
-#     `parse_postfix` / `evaluate_node`;
+# over a variable environment. Remaining extension points:
+#   * bytes/timestamp/duration values and their functions;
+#   * `type(x)` and type values (deliberately skipped: honest type
+#     values need type literals like `int` as identifiers, and a string
+#     stand-in would make `type(x) == "int"` hold where cel-spec says it
+#     must not);
 #   * a type checker: a separate pass over the same `Node` tree.
 #
 # Semantics follow cel-spec where the subset touches it:
@@ -24,13 +27,38 @@
 #     Julia's cross-type numeric comparisons are mathematically exact, so
 #     distinct 64-bit integers never alias through a double;
 #   * bool is NOT numeric (`true != 1`);
+#   * arithmetic is CHECKED: Int64/UInt64 overflow, integer division or
+#     modulo by zero, and INT64_MIN / -1 (or % -1) are evaluation
+#     ERRORS, never wraparound or a Julia crash; integer division
+#     truncates toward zero and `%` keeps the dividend's sign; doubles
+#     follow IEEE 754 (`x / 0.0` is +/-Inf, per cel-spec never a
+#     division error) and have NO `%` overload; operands must share a
+#     numeric type (int/uint/double) -- cel-spec has no implicit
+#     numeric promotion (`1 + 1u` errors) even though EQUALITY is exact
+#     across types;
+#   * `+` also concatenates strings and lists;
+#   * map literal keys must be string/int/uint/bool (cel-spec); a
+#     duplicate key (by the same exact cross-type equality as `==`) is
+#     an evaluation error; map indexing and `in` use that equality too;
 #   * a missing variable, member, or key is an evaluation ERROR (CEL's
-#     absent-field semantics), not `null`;
+#     absent-field semantics), not `null`; `has(e.f)` is the presence
+#     test, and is a macro -- its argument must be a field selection AT
+#     COMPILE TIME;
+#   * `matches` compiles the pattern with Julia's PCRE, a strict
+#     SUPERSET of cel-spec's RE2 subset: every conformant pattern
+#     works, but PCRE-only constructs (backreferences, lookaround) are
+#     accepted here where a strict RE2 engine would reject them;
 #   * `&&`/`||` absorb an errored arm when the other arm alone decides
 #     the result (false decides `&&`, true decides `||`); otherwise the
-#     error propagates;
-#   * evaluation is wall-clock bounded (`timeout`); a timeout is never
-#     absorbed by `&&`/`||`;
+#     error propagates; comprehensions mirror this per cel-spec:
+#     `exists` absorbs per-element errors once a true is found, `all`
+#     once a false is found, while `exists_one`/`filter`/`map` propagate
+#     the first error; comprehensions over a map iterate its KEYS;
+#   * the ternary evaluates ONLY the taken branch, and its condition
+#     must be a bool;
+#   * evaluation is wall-clock bounded (`timeout`), re-checked on every
+#     comprehension iteration; a timeout is never absorbed by `&&`/`||`
+#     or by `exists`/`all`;
 #   * a non-boolean result from `evaluate_bool` is an error, never a
 #     truthiness coercion.
 module CommonExpressionLanguage
@@ -43,7 +71,7 @@ struct CELParseError <: Exception
 end
 Base.showerror(io::IO, e::CELParseError) = print(io, "CELParseError: ", e.msg)
 
-"A compiled expression failed at evaluation: missing variable/member/key, type mismatch, non-boolean where a boolean is required, or the wall-clock bound exceeded."
+"A compiled expression failed at evaluation: missing variable/member/key, type mismatch, checked-arithmetic overflow, non-boolean where a boolean is required, or the wall-clock bound exceeded."
 struct CELEvalError <: Exception
     msg::String
 end
@@ -81,8 +109,11 @@ function tokenize(src::AbstractString)
             end
             push!(out, Token(TID, String(cs[i:j-1]), nothing))
             i = j
-        elseif isdigit(c) || (c == '-' && i < n && isdigit(cs[i+1]))
-            j = i + (c == '-' ? 1 : 0)
+        elseif isdigit(c)
+            # Numbers lex non-negatively; `-` is always an operator token
+            # and unary minus folds literals in the parser (cel-spec has
+            # no negative literals either, so `a-1` is a subtraction).
+            j = i
             isfloat = false
             while j <= n && isdigit(cs[j])
                 j += 1
@@ -98,13 +129,13 @@ function tokenize(src::AbstractString)
             value = if isfloat
                 parse(Float64, text)
             else
-                # Negative literals parse as Int64; non-negative at full
-                # u64 width (context values carry u64 serials/hashes, and
-                # cel-spec integers are exact). Over-range refuses at
-                # compile time, never silently clamps.
+                # Literals parse as Int64, falling back to full u64 width
+                # (context values carry u64 serials/hashes, and cel-spec
+                # integers are exact). Over-range refuses at compile
+                # time, never silently clamps.
                 v = tryparse(Int64, text)
                 if v === nothing
-                    u = c == '-' ? nothing : tryparse(UInt64, text)
+                    u = tryparse(UInt64, text)
                     u === nothing &&
                         throw(CELParseError("integer literal out of range"))
                     u
@@ -147,7 +178,8 @@ function tokenize(src::AbstractString)
             if two in ("&&", "||", "==", "!=", "<=", ">=")
                 push!(out, Token(TOP, two, nothing))
                 i += 2
-            elseif c in ('(', ')', '[', ']', '.', '!', '<', '>', ',')
+            elseif c in ('(', ')', '[', ']', '{', '}', '.', ',', '!',
+                         '<', '>', '+', '-', '*', '/', '%', '?', ':')
                 push!(out, Token(TOP, string(c), nothing))
                 i += 1
             else
@@ -160,16 +192,26 @@ function tokenize(src::AbstractString)
 end
 
 # ---------------------------------------------------------------------------
-# AST + parser. Recursive descent over the grammar (loosest first):
+# AST + parser. Recursive descent over the grammar (loosest first),
+# mirroring cel-spec's precedence ladder:
 #
+#   expr     := or ( '?' or ':' expr )?
 #   or       := and ( '||' and )*
 #   and      := rel ( '&&' rel )*
-#   rel      := unary ( ('=='|'!='|'<'|'<='|'>'|'>=') unary )?
-#   unary    := '!' unary | postfix
-#   postfix  := primary ( '.' ident | '.' method '(' or ')' | '[' or ']' )*
-#   primary  := literal | ident | '(' or ')'
+#   rel      := add ( ('=='|'!='|'<'|'<='|'>'|'>='|'in') add )?
+#   add      := mul ( ('+'|'-') mul )*
+#   mul      := unary ( ('*'|'/'|'%') unary )*
+#   unary    := ('!'|'-') unary | postfix
+#   postfix  := primary ( '.' ident | '.' method '(' expr ')'
+#                       | '.' macro '(' ident ',' expr ')'
+#                       | '[' expr ']' )*
+#   primary  := literal | ident | func '(' expr (',' expr)* ')'
+#             | '(' expr ')' | '[' exprlist? ']' | '{' entrylist? '}'
 #   literal  := string | number | 'true' | 'false' | 'null'
-#   method   := 'startsWith' | 'endsWith' | 'contains'
+#   method   := 'startsWith' | 'endsWith' | 'contains' | 'matches'
+#   macro    := 'exists' | 'all' | 'exists_one' | 'filter' | 'map'
+#   func     := 'size' | 'has' | 'string' | 'int' | 'uint' | 'double'
+#             | 'matches'
 
 abstract type Node end
 struct Lit <: Node
@@ -194,13 +236,45 @@ end
 struct Not <: Node
     operand::Node
 end
+struct Neg <: Node
+    operand::Node
+end
 struct Bin <: Node
     op::String
     a::Node
     b::Node
 end
+struct Cond <: Node
+    cond::Node
+    then::Node
+    els::Node
+end
+struct ListLit <: Node
+    items::Vector{Node}
+end
+struct MapLit <: Node
+    entries::Vector{Tuple{Node,Node}}
+end
+struct Call <: Node        # global function
+    name::String
+    args::Vector{Node}
+end
+struct Has <: Node         # has(e.f) -- the macro's compiled form
+    object::Node
+    field::String
+end
+struct Compr <: Node       # e.kind(var, body) comprehension macros
+    object::Node
+    kind::String
+    var::String
+    body::Node
+end
 
-const STRING_METHODS = ("startsWith", "endsWith", "contains")
+const STRING_METHODS = ("startsWith", "endsWith", "contains", "matches")
+const MACRO_METHODS = ("exists", "all", "exists_one", "filter", "map")
+const GLOBAL_FUNCTIONS = ("size", "has", "string", "int", "uint", "double",
+                          "matches")
+const KEYWORDS = ("true", "false", "null", "in")
 
 mutable struct Parser
     toks::Vector{Token}
@@ -226,6 +300,19 @@ function _descend(f, p::Parser)
     end
 end
 
+# cel-spec: Expr := ConditionalOr ['?' ConditionalOr ':' Expr] -- the
+# else branch recurses, so `a ? b : c ? d : e` groups to the right.
+parse_expr(p::Parser) = _descend(p) do
+    node = parse_or(p)
+    if _isop(_peek(p), "?")
+        _next!(p)
+        then_ = parse_or(p)
+        _expect_op!(p, ":")
+        node = Cond(node, then_, parse_expr(p))
+    end
+    node
+end
+
 parse_or(p::Parser) = _descend(p) do
     node = parse_and(p)
     while _isop(_peek(p), "||")
@@ -245,11 +332,32 @@ parse_and(p::Parser) = _descend(p) do
 end
 
 parse_rel(p::Parser) = _descend(p) do
-    node = parse_unary(p)
+    node = parse_add(p)
     t = _peek(p)
     if t.kind == TOP && t.text in ("==", "!=", "<", "<=", ">", ">=")
         _next!(p)
-        node = Bin(t.text, node, parse_unary(p))
+        node = Bin(t.text, node, parse_add(p))
+    elseif t.kind == TID && t.text == "in"
+        _next!(p)
+        node = Bin("in", node, parse_add(p))
+    end
+    node
+end
+
+parse_add(p::Parser) = _descend(p) do
+    node = parse_mul(p)
+    while _peek(p).kind == TOP && _peek(p).text in ("+", "-")
+        op = _next!(p).text
+        node = Bin(op, node, parse_mul(p))
+    end
+    node
+end
+
+parse_mul(p::Parser) = _descend(p) do
+    node = parse_unary(p)
+    while _peek(p).kind == TOP && _peek(p).text in ("*", "/", "%")
+        op = _next!(p).text
+        node = Bin(op, node, parse_unary(p))
     end
     node
 end
@@ -258,6 +366,20 @@ parse_unary(p::Parser) = _descend(p) do
     if _isop(_peek(p), "!")
         _next!(p)
         return Not(parse_unary(p))
+    elseif _isop(_peek(p), "-")
+        _next!(p)
+        operand = parse_unary(p)
+        # Fold negated numeric literals so `-7` stays an exact Int64 and
+        # `-9223372036854775808` (whose magnitude only lexes at u64
+        # width) reaches typemin(Int64), as cel-spec's parser requires.
+        # Anything unfoldable becomes a runtime Neg (checked there).
+        if operand isa Lit
+            v = operand.value
+            v isa Float64 && return Lit(-v)
+            v isa Int64 && v != typemin(Int64) && return Lit(-v)
+            v isa UInt64 && v == UInt64(1) << 63 && return Lit(typemin(Int64))
+        end
+        return Neg(operand)
     end
     parse_postfix(p)
 end
@@ -272,24 +394,47 @@ parse_postfix(p::Parser) = _descend(p) do
             id.kind == TID ||
                 throw(CELParseError("expected an identifier after '.'"))
             if _isop(_peek(p), "(")
-                id.text in STRING_METHODS ||
-                    throw(CELParseError("unsupported method '$(id.text)'"))
                 _next!(p)
-                arg = parse_or(p)
-                _expect_op!(p, ")")
-                node = MethodCall(node, id.text, arg)
+                if id.text in STRING_METHODS
+                    arg = parse_expr(p)
+                    _expect_op!(p, ")")
+                    node = MethodCall(node, id.text, arg)
+                elseif id.text in MACRO_METHODS
+                    v = _next!(p)
+                    (v.kind == TID && !(v.text in KEYWORDS)) ||
+                        throw(CELParseError("comprehension variable must be an identifier"))
+                    _expect_op!(p, ",")
+                    body = parse_expr(p)
+                    _expect_op!(p, ")")
+                    node = Compr(node, id.text, v.text, body)
+                else
+                    throw(CELParseError("unsupported method '$(id.text)'"))
+                end
             else
                 node = Member(node, id.text)
             end
         elseif _isop(t, "[")
             _next!(p)
-            idx = parse_or(p)
+            idx = parse_expr(p)
             _expect_op!(p, "]")
             node = Index(node, idx)
         else
             return node
         end
     end
+end
+
+function _parse_args!(p::Parser)   # '(' already consumed
+    args = Node[]
+    if !_isop(_peek(p), ")")
+        push!(args, parse_expr(p))
+        while _isop(_peek(p), ",")
+            _next!(p)
+            push!(args, parse_expr(p))
+        end
+    end
+    _expect_op!(p, ")")
+    return args
 end
 
 parse_primary(p::Parser) = _descend(p) do
@@ -300,11 +445,50 @@ parse_primary(p::Parser) = _descend(p) do
         t.text == "true" && return Lit(true)
         t.text == "false" && return Lit(false)
         t.text == "null" && return Lit(nothing)
+        t.text == "in" &&
+            throw(CELParseError("'in' is an operator, not an identifier"))
+        if _isop(_peek(p), "(")
+            _next!(p)
+            t.text in GLOBAL_FUNCTIONS ||
+                throw(CELParseError("unsupported function '$(t.text)'"))
+            args = _parse_args!(p)
+            if t.text == "has"
+                # has() is a macro: its argument must BE a field
+                # selection, checked at compile time (cel-spec).
+                (length(args) == 1 && args[1] isa Member) ||
+                    throw(CELParseError("has() requires a single field-selection argument"))
+                return Has(args[1].object, args[1].name)
+            end
+            nargs = t.text == "matches" ? 2 : 1
+            length(args) == nargs ||
+                throw(CELParseError("$(t.text)() takes exactly $(nargs) argument$(nargs == 1 ? "" : "s")"))
+            return Call(t.text, args)
+        end
         return Ident(t.text)
     elseif _isop(t, "(")
-        node = parse_or(p)
+        node = parse_expr(p)
         _expect_op!(p, ")")
         return node
+    elseif _isop(t, "[")
+        items = Node[]
+        while !_isop(_peek(p), "]")
+            push!(items, parse_expr(p))
+            _isop(_peek(p), ",") || break
+            _next!(p)   # cel-spec allows a trailing comma before ']'
+        end
+        _expect_op!(p, "]")
+        return ListLit(items)
+    elseif _isop(t, "{")
+        entries = Tuple{Node,Node}[]
+        while !_isop(_peek(p), "}")
+            k = parse_expr(p)
+            _expect_op!(p, ":")
+            push!(entries, (k, parse_expr(p)))
+            _isop(_peek(p), ",") || break
+            _next!(p)   # cel-spec allows a trailing comma before '}'
+        end
+        _expect_op!(p, "}")
+        return MapLit(entries)
     end
     throw(CELParseError("unexpected token '$(t.text)'"))
 end
@@ -321,7 +505,7 @@ function compile(source::AbstractString)
     sizeof(source) > MAX_EXPR_LENGTH &&
         throw(CELParseError("expression exceeds the $(MAX_EXPR_LENGTH)-byte cap"))
     p = Parser(tokenize(source), 1, 0)
-    ast = parse_or(p)
+    ast = parse_expr(p)
     _peek(p).kind == TEOF ||
         throw(CELParseError("trailing input after expression"))
     return ast
@@ -329,6 +513,26 @@ end
 
 # ---------------------------------------------------------------------------
 # Evaluator.
+
+# A comprehension extends the environment with its loop variable.
+# Chained scopes give natural shadowing for nested comprehensions; only
+# haskey/getindex drive evaluation (iterate exists for display and may
+# revisit a shadowed parent key).
+struct VarScope <: AbstractDict{String,Any}
+    name::String
+    value::Any
+    parent::AbstractDict
+end
+Base.haskey(s::VarScope, k) = k == s.name || haskey(s.parent, k)
+Base.getindex(s::VarScope, k) = k == s.name ? s.value : s.parent[k]
+Base.length(s::VarScope) = 1 + length(s.parent)
+function Base.iterate(s::VarScope, state=(true, nothing))
+    own, pstate = state
+    own && return (s.name => s.value), (false, nothing)
+    it = pstate === nothing ? iterate(s.parent) : iterate(s.parent, pstate)
+    it === nothing && return nothing
+    return it[1], (false, it[2])
+end
 
 struct EvalCtx
     vars::AbstractDict
@@ -358,6 +562,10 @@ function _cel_eq(a, b)
     return a == b
 end
 
+# Map keys are string/int/uint/bool per cel-spec (never double or bool
+# aliasing a number: bool keys compare only with bools via _cel_eq).
+_valid_map_key(k) = k isa AbstractString || k isa Integer   # Bool <: Integer
+
 function evaluate_node(n::Node, ctx::EvalCtx)
     _check_deadline(ctx)
     if n isa Lit
@@ -374,9 +582,19 @@ function evaluate_node(n::Node, ctx::EvalCtx)
     elseif n isa Index
         obj = evaluate_node(n.object, ctx)
         idx = evaluate_node(n.index, ctx)
-        if obj isa AbstractDict && idx isa AbstractString
-            haskey(obj, idx) || throw(CELEvalError("missing key '$(idx)'"))
-            return obj[idx]
+        if obj isa AbstractDict
+            if idx isa AbstractString || idx isa Bool
+                haskey(obj, idx) || throw(CELEvalError("missing key '$(idx)'"))
+                return obj[idx]
+            elseif _isnum(idx)
+                # Exact cross-type numeric key equality, same as `==`
+                # (modern cel-spec: `{1: 'a'}[1u]` succeeds).
+                for (k, v) in obj
+                    _cel_eq(k, idx) && return v
+                end
+                throw(CELEvalError("missing key '$(idx)'"))
+            end
+            throw(CELEvalError("invalid map key type"))
         elseif obj isa AbstractVector && _isnum(idx)
             (idx isa Integer || isinteger(idx)) ||
                 throw(CELEvalError("index out of range"))
@@ -392,13 +610,272 @@ function evaluate_node(n::Node, ctx::EvalCtx)
             throw(CELEvalError("string method on a non-string value"))
         n.name == "startsWith" && return startswith(obj, arg)
         n.name == "endsWith" && return endswith(obj, arg)
+        n.name == "matches" && return _cel_matches(obj, arg)
         return occursin(arg, obj)          # contains
     elseif n isa Not
         return !_eval_bool(n.operand, ctx)
+    elseif n isa Neg
+        v = evaluate_node(n.operand, ctx)
+        if v isa Signed                    # Bool is neither Signed nor Unsigned
+            (v isa Int64 && v == typemin(Int64)) &&
+                throw(CELEvalError("integer overflow in unary '-'"))
+            return -Int64(v)
+        elseif v isa AbstractFloat
+            return -Float64(v)
+        end
+        throw(CELEvalError("no matching overload for unary '-'"))  # uint/bool/...
+    elseif n isa Cond
+        c = evaluate_node(n.cond, ctx)
+        c isa Bool ||
+            throw(CELEvalError("ternary condition evaluated to a non-boolean"))
+        return evaluate_node(c ? n.then : n.els, ctx)   # only the taken branch
+    elseif n isa ListLit
+        return Any[evaluate_node(x, ctx) for x in n.items]
+    elseif n isa MapLit
+        out = Dict{Any,Any}()
+        ks = Any[]
+        for (kn, vn) in n.entries
+            k = evaluate_node(kn, ctx)
+            _valid_map_key(k) ||
+                throw(CELEvalError("map key must be string, int, uint, or bool"))
+            any(x -> _cel_eq(x, k), ks) &&
+                throw(CELEvalError("duplicate map key"))
+            push!(ks, k)
+            out[k] = evaluate_node(vn, ctx)
+        end
+        return out
+    elseif n isa Call
+        return _eval_call(n, ctx)
+    elseif n isa Has
+        obj = evaluate_node(n.object, ctx)
+        obj isa AbstractDict ||
+            throw(CELEvalError("has() on a non-map value"))
+        return haskey(obj, n.field)        # absent field: false, not an error
+    elseif n isa Compr
+        return _eval_compr(n, ctx)
     elseif n isa Bin
         return _eval_bin(n, ctx)
     end
     throw(CELEvalError("unreachable node kind"))
+end
+
+# cel-spec requires RE2 syntax for matches(); Julia's PCRE is a strict
+# SUPERSET of the RE2 subset, so every conformant pattern behaves
+# identically, but PCRE-only constructs (backreferences, lookaround) are
+# accepted here where a strict RE2 engine would reject the pattern.
+function _cel_matches(s::AbstractString, pat::AbstractString)
+    re = try
+        Regex(pat)
+    catch
+        throw(CELEvalError("invalid regular expression"))
+    end
+    try
+        return occursin(re, s)             # unanchored, as cel-spec requires
+    catch
+        throw(CELEvalError("regular expression match failed"))
+    end
+end
+
+function _eval_call(n::Call, ctx::EvalCtx)
+    if n.name == "matches"
+        s = evaluate_node(n.args[1], ctx)
+        pat = evaluate_node(n.args[2], ctx)
+        (s isa AbstractString && pat isa AbstractString) ||
+            throw(CELEvalError("matches() requires string arguments"))
+        return _cel_matches(s, pat)
+    end
+    v = evaluate_node(n.args[1], ctx)
+    if n.name == "size"
+        v isa AbstractString && return Int64(length(v))   # codepoints, not bytes
+        (v isa AbstractVector || v isa AbstractDict) && return Int64(length(v))
+        throw(CELEvalError("size() on an unsupported type"))
+    elseif n.name == "string"
+        # Doubles use Julia's shortest-roundtrip formatting, which can
+        # differ cosmetically from cel-go's (e.g. "1.0e23" vs "1e+23").
+        v isa AbstractString && return String(v)
+        v isa Bool && return v ? "true" : "false"
+        _isnum(v) && return string(v)
+        throw(CELEvalError("string() on an unsupported type"))
+    elseif n.name == "int"
+        return _to_int(v)
+    elseif n.name == "uint"
+        return _to_uint(v)
+    end
+    return _to_double(v)                   # parser admits no other names
+end
+
+function _to_int(v)
+    v isa Signed && return Int64(v)
+    if v isa Unsigned
+        v <= typemax(Int64) || throw(CELEvalError("int() out of range"))
+        return Int64(v)
+    elseif v isa AbstractFloat
+        f = trunc(Float64(v))              # cel-spec: truncation toward zero
+        (isnan(f) || f < -9.223372036854775808e18 || f >= 9.223372036854775808e18) &&
+            throw(CELEvalError("int() out of range"))
+        return Int64(f)
+    elseif v isa AbstractString
+        x = tryparse(Int64, v)
+        x === nothing && throw(CELEvalError("int() could not parse the string"))
+        return x
+    end
+    throw(CELEvalError("int() on an unsupported type"))
+end
+
+function _to_uint(v)
+    if v isa Bool
+        throw(CELEvalError("uint() on an unsupported type"))
+    elseif v isa Unsigned
+        return UInt64(v)
+    elseif v isa Signed
+        v >= 0 || throw(CELEvalError("uint() out of range"))
+        return UInt64(v)
+    elseif v isa AbstractFloat
+        f = trunc(Float64(v))
+        (isnan(f) || f < 0 || f >= 1.8446744073709552e19) &&
+            throw(CELEvalError("uint() out of range"))
+        return UInt64(f)
+    elseif v isa AbstractString
+        x = tryparse(UInt64, v)
+        x === nothing && throw(CELEvalError("uint() could not parse the string"))
+        return x
+    end
+    throw(CELEvalError("uint() on an unsupported type"))
+end
+
+function _to_double(v)
+    v isa Bool && throw(CELEvalError("double() on an unsupported type"))
+    v isa Number && return Float64(v)
+    if v isa AbstractString
+        x = tryparse(Float64, v)
+        x === nothing && throw(CELEvalError("double() could not parse the string"))
+        return x
+    end
+    throw(CELEvalError("double() on an unsupported type"))
+end
+
+# Arithmetic. cel-spec has no implicit numeric promotion: both operands
+# must be ints, both uints, or both doubles (`1 + 1.0` errors even
+# though `1 == 1.0` holds). Integer arithmetic is CHECKED (Base.Checked):
+# overflow, division/modulo by zero, and INT64_MIN / -1 (or % -1) are
+# evaluation errors, never wraparound. Integer `/` truncates toward zero
+# and `%` keeps the dividend's sign (Julia's div/rem). Doubles follow
+# IEEE 754 -- `x / 0.0` is +/-Inf, never an error -- and cel-spec gives
+# `%` no double overload.
+function _eval_arith(op::String, l, r)
+    if op == "+"
+        l isa AbstractString && r isa AbstractString && return l * r
+        if l isa AbstractVector && r isa AbstractVector
+            out = Any[]
+            append!(out, l)
+            append!(out, r)
+            return out
+        end
+    end
+    if l isa AbstractFloat && r isa AbstractFloat
+        a, b = Float64(l), Float64(r)
+        op == "+" && return a + b
+        op == "-" && return a - b
+        op == "*" && return a * b
+        op == "/" && return a / b
+        throw(CELEvalError("no matching overload for '%' on doubles"))
+    elseif l isa Signed && r isa Signed        # Bool is neither Signed nor Unsigned
+        a, b = Int64(l), Int64(r)
+        try
+            op == "+" && return Base.checked_add(a, b)
+            op == "-" && return Base.checked_sub(a, b)
+            op == "*" && return Base.checked_mul(a, b)
+            if op == "/"
+                b == 0 && throw(CELEvalError("division by zero"))
+                return div(a, b)   # truncates toward zero; typemin/-1 raises DivideError
+            end
+            b == 0 && throw(CELEvalError("modulo by zero"))
+            (a == typemin(Int64) && b == -1) &&
+                throw(CELEvalError("integer overflow in '%'"))
+            return rem(a, b)
+        catch e
+            e isa CELEvalError && rethrow()
+            (e isa OverflowError || e isa DivideError) &&
+                throw(CELEvalError("integer overflow in '$(op)'"))
+            rethrow()
+        end
+    elseif l isa Unsigned && r isa Unsigned
+        a, b = UInt64(l), UInt64(r)
+        try
+            op == "+" && return Base.checked_add(a, b)
+            op == "-" && return Base.checked_sub(a, b)
+            op == "*" && return Base.checked_mul(a, b)
+            b == 0 &&
+                throw(CELEvalError(op == "/" ? "division by zero" : "modulo by zero"))
+            op == "/" && return div(a, b)
+            return rem(a, b)
+        catch e
+            e isa CELEvalError && rethrow()
+            e isa OverflowError &&
+                throw(CELEvalError("unsigned integer overflow in '$(op)'"))
+            rethrow()
+        end
+    end
+    throw(CELEvalError("no matching overload for '$(op)'"))
+end
+
+# `x in list` tests element membership, `x in map` tests KEY membership,
+# both by the same exact cross-type equality as `==`.
+function _eval_in(x, coll)
+    coll isa AbstractVector && return any(e -> _cel_eq(e, x), coll)
+    coll isa AbstractDict && return any(k -> _cel_eq(k, x), keys(coll))
+    throw(CELEvalError("'in' on a non-list/non-map value"))
+end
+
+# Comprehension macros. A map comprehension iterates its KEYS (cel-spec).
+# `exists`/`all` mirror `||`/`&&` error absorption: a per-element error
+# is absorbed when some element decides the result (a true decides
+# `exists`, a false decides `all`); otherwise the FIRST error propagates.
+# `exists_one`, `filter`, and `map` propagate any error immediately.
+# The wall clock is re-checked every iteration and a timeout is never
+# absorbed.
+function _eval_compr(n::Compr, ctx::EvalCtx)
+    obj = evaluate_node(n.object, ctx)
+    items = obj isa AbstractVector ? obj :
+            obj isa AbstractDict ? collect(keys(obj)) :
+            throw(CELEvalError("comprehension over a non-list/non-map value"))
+    body_ctx(item) = EvalCtx(VarScope(n.var, item, ctx.vars), ctx.deadline)
+    if n.kind == "exists" || n.kind == "all"
+        decides = n.kind == "exists"
+        err = nothing
+        for item in items
+            _check_deadline(ctx)
+            try
+                _eval_bool(n.body, body_ctx(item)) == decides && return decides
+            catch e
+                e isa CELEvalError || rethrow()
+                _check_deadline(ctx)       # a timeout is never absorbed
+                err === nothing && (err = e)
+            end
+        end
+        err === nothing || throw(err)
+        return !decides
+    elseif n.kind == "exists_one"
+        hits = 0
+        for item in items
+            _check_deadline(ctx)
+            _eval_bool(n.body, body_ctx(item)) && (hits += 1)
+        end
+        return hits == 1
+    elseif n.kind == "filter"
+        out = Any[]
+        for item in items
+            _check_deadline(ctx)
+            _eval_bool(n.body, body_ctx(item)) && push!(out, item)
+        end
+        return out
+    end
+    out = Any[]                            # n.kind == "map"
+    for item in items
+        _check_deadline(ctx)
+        push!(out, evaluate_node(n.body, body_ctx(item)))
+    end
+    return out
 end
 
 function _eval_bin(n::Bin, ctx::EvalCtx)
@@ -430,6 +907,8 @@ function _eval_bin(n::Bin, ctx::EvalCtx)
     r = evaluate_node(n.b, ctx)
     n.op == "==" && return _cel_eq(l, r)
     n.op == "!=" && return !_cel_eq(l, r)
+    n.op == "in" && return _eval_in(l, r)
+    n.op in ("+", "-", "*", "/", "%") && return _eval_arith(n.op, l, r)
     # Ordering: numbers with numbers (exact across integer/float types),
     # strings with strings; anything else refuses.
     if _isnum(l) && _isnum(r)
@@ -453,8 +932,9 @@ end
 Evaluate a compiled expression (or compile a source string first)
 against the variable environment `vars`. Returns the resulting value.
 Throws [`CELEvalError`](@ref) on missing variables/members/keys, type
-mismatches, or exceeding `timeout` (seconds, wall clock);
-[`CELParseError`](@ref) when given an uncompilable source string.
+mismatches, checked-arithmetic overflow, or exceeding `timeout`
+(seconds, wall clock); [`CELParseError`](@ref) when given an
+uncompilable source string.
 """
 evaluate(source::AbstractString, vars::AbstractDict; timeout::Real=Inf) =
     evaluate(compile(source), vars; timeout)

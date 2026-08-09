@@ -55,6 +55,251 @@ const CTX = Dict{String,Any}(
         @test !evaluate_bool("status.online == 1", CTX)
     end
 
+    @testset "arithmetic" begin
+        @test evaluate("1 + 2", CTX) === Int64(3)
+        @test evaluate("7 - 10", CTX) === Int64(-3)
+        @test evaluate("6 * 7", CTX) === Int64(42)
+        @test evaluate("1 + 2 * 3", CTX) === Int64(7)          # precedence
+        @test evaluate("(1 + 2) * 3", CTX) === Int64(9)
+        @test evaluate("status.battery + bindings.threshold", CTX) == 122
+        # integer division truncates toward zero; % keeps the dividend's sign
+        @test evaluate("7 / 2", CTX) === Int64(3)
+        @test evaluate("-7 / 2", CTX) === Int64(-3)
+        @test evaluate("7 % 2", CTX) === Int64(1)
+        @test evaluate("-7 % 2", CTX) === Int64(-1)
+        @test evaluate("7 % -2", CTX) === Int64(1)
+        # uint arithmetic stays uint
+        @test evaluate("bindings.big - 18446744073709551615", CTX) === UInt64(0)
+        @test evaluate("bindings.big / bindings.big", CTX) === UInt64(1)
+        @test evaluate("bindings.big % bindings.big", CTX) === UInt64(0)
+        # double arithmetic
+        @test evaluate("1.5 + 2.25", CTX) === 3.75
+        @test evaluate("1.0 / 4.0", CTX) === 0.25
+        @test evaluate("status.temperature * 2.0", CTX) === 73.0
+        # doubles follow IEEE 754: division by zero is Inf, not an error
+        @test evaluate("1.0 / 0.0", CTX) === Inf
+        @test evaluate("-1.0 / 0.0", CTX) === -Inf
+        # ...but doubles have no '%' overload
+        @test_throws CELEvalError evaluate("1.5 % 2.0", CTX)
+        # string and list concatenation
+        @test evaluate("'foo' + 'bar'", CTX) == "foobar"
+        @test evaluate("labels.zone + '1'", CTX) == "A1"
+        @test evaluate("[1, 2] + [3]", CTX) == Any[1, 2, 3]
+        @test evaluate("size(bindings.mask[0] + bindings.mask[1])", CTX) == 6
+        # integer division/modulo by zero is an error, not a crash
+        @test_throws CELEvalError evaluate("1 / 0", CTX)
+        @test_throws CELEvalError evaluate("1 % 0", CTX)
+        @test_throws CELEvalError evaluate("bindings.big / 0", CTX)
+        @test_throws CELEvalError evaluate("bindings.big % 0", CTX)
+        # checked arithmetic: Int64/UInt64 overflow is an error
+        @test_throws CELEvalError evaluate("9223372036854775807 + 1", CTX)
+        @test_throws CELEvalError evaluate("-9223372036854775808 - 1", CTX)
+        @test_throws CELEvalError evaluate("9223372036854775807 * 2", CTX)
+        @test_throws CELEvalError evaluate("-9223372036854775808 / (0 - 1)", CTX)
+        @test_throws CELEvalError evaluate("-9223372036854775808 % (0 - 1)", CTX)
+        @test_throws CELEvalError evaluate("bindings.big + bindings.big", CTX)
+        @test_throws CELEvalError evaluate(
+            "18446744073709551614 - 18446744073709551615", CTX)
+        # no implicit numeric promotion (cel-spec), and no bool arithmetic
+        @test_throws CELEvalError evaluate("1 + 1.0", CTX)
+        @test_throws CELEvalError evaluate("bindings.big + 1", CTX)
+        @test_throws CELEvalError evaluate("true + true", CTX)
+        @test_throws CELEvalError evaluate("'a' + 1", CTX)
+        @test_throws CELEvalError evaluate("[1] + 'a'", CTX)
+    end
+
+    @testset "unary minus" begin
+        @test evaluate("-(1 + 2)", CTX) === Int64(-3)
+        @test evaluate("- -3", CTX) === Int64(3)
+        @test evaluate("-status.temperature", CTX) === -36.5
+        @test evaluate("-status.battery", CTX) == -72
+        @test evaluate("-9223372036854775808", CTX) === typemin(Int64)
+        @test_throws CELEvalError evaluate("-(-9223372036854775808)", CTX)
+        @test_throws CELEvalError evaluate("-bindings.big", CTX)  # no uint negation
+        @test_throws CELEvalError evaluate("-'a'", CTX)
+        @test_throws CELEvalError evaluate("-true", CTX)
+        # negative magnitudes beyond typemin have no home
+        @test_throws CELEvalError evaluate("-18446744073709551615", CTX)
+    end
+
+    @testset "in" begin
+        @test evaluate_bool("2 in [1, 2, 3]", CTX)
+        @test !evaluate_bool("4 in [1, 2, 3]", CTX)
+        @test evaluate_bool("2 in [1.0, 2.0]", CTX)      # exact cross-type equality
+        @test !evaluate_bool("true in [1]", CTX)         # bool is not numeric
+        @test evaluate_bool("'zone' in labels", CTX)     # map: key membership
+        @test !evaluate_bool("'nope' in labels", CTX)
+        @test evaluate_bool("1 in {1: 'a'}", CTX)
+        @test evaluate_bool("1.0 in {1: 'a'}", CTX)
+        @test evaluate_bool("[1] in [[1], [2]]", CTX)
+        @test !evaluate_bool("2 in []", CTX)
+        @test evaluate_bool("1 + 1 in [2]", CTX)         # 'in' binds looser than '+'
+        @test_throws CELEvalError evaluate("1 in 5", CTX)
+        @test_throws CELEvalError evaluate("'a' in 'abc'", CTX)
+        @test_throws CELParseError CEL.compile("in")     # reserved word
+    end
+
+    @testset "ternary" begin
+        @test evaluate("true ? 1 : 2", CTX) == 1
+        @test evaluate("false ? 1 : 2", CTX) == 2
+        @test evaluate("status.battery > 50 ? 'ok' : 'low'", CTX) == "ok"
+        # lazy: only the taken branch evaluates
+        @test evaluate("true ? 1 : nosuchvar", CTX) == 1
+        @test evaluate("false ? nosuchvar : 2", CTX) == 2
+        # right-associative else branch
+        @test evaluate("false ? 1 : true ? 2 : 3", CTX) == 2
+        @test evaluate("[10, 20][true ? 0 : 1]", CTX) == 10
+        # a non-bool condition is an error
+        @test_throws CELEvalError evaluate("1 ? 2 : 3", CTX)
+        @test_throws CELEvalError evaluate("nosuchvar ? 2 : 3", CTX)
+        @test_throws CELParseError CEL.compile("true ? 1")      # missing ':'
+        @test_throws CELParseError CEL.compile("true ? : 1")
+    end
+
+    @testset "list and map literals" begin
+        @test evaluate("[]", CTX) == Any[]
+        @test evaluate("[1, 'a', true][1]", CTX) == "a"
+        @test evaluate("[1, 2,]", CTX) == Any[1, 2]              # trailing comma
+        @test evaluate("[[1], [2, 3]][1][0]", CTX) == 2
+        @test evaluate("size({})", CTX) == 0
+        @test evaluate("{'k': 1, 'j': 2}['k']", CTX) == 1
+        @test evaluate("{1: 'a', 2: 'b'}[2]", CTX) == "b"
+        @test evaluate("{1: 'a'}[1.0]", CTX) == "a"              # exact cross-type key
+        @test evaluate("{18446744073709551615: 'x'}[bindings.big]", CTX) == "x"
+        @test evaluate("{true: 'y'}[true]", CTX) == "y"
+        @test evaluate("{'k': 1,}['k']", CTX) == 1               # trailing comma
+        @test evaluate("{'battery': status.battery}['battery']", CTX) == 72
+        # keys are string/int/uint/bool only (cel-spec)
+        @test_throws CELEvalError evaluate("{1.5: 'x'}", CTX)
+        @test_throws CELEvalError evaluate("{null: 'x'}", CTX)
+        @test_throws CELEvalError evaluate("{[1]: 'x'}", CTX)
+        # duplicate keys (by exact cross-type equality) are an error
+        @test_throws CELEvalError evaluate("{1: 'a', 1: 'b'}", CTX)
+        @test_throws CELEvalError evaluate("{'missing': nosuchvar}", CTX)
+        @test_throws CELEvalError evaluate("{'k': 1}['j']", CTX)
+        @test_throws CELParseError CEL.compile("[1 2]")
+        @test_throws CELParseError CEL.compile("{1, 2}")
+        @test_throws CELParseError CEL.compile("{'k' 1}")
+    end
+
+    @testset "size, conversions" begin
+        @test evaluate("size('')", CTX) === Int64(0)
+        @test evaluate("size('héllo')", CTX) === Int64(5)        # codepoints, not bytes
+        @test evaluate("size([1, 2, 3])", CTX) === Int64(3)
+        @test evaluate("size(labels)", CTX) === Int64(2)
+        @test evaluate_bool("size(bindings.mask) > 0", CTX)
+        @test_throws CELEvalError evaluate("size(1)", CTX)
+        @test_throws CELEvalError evaluate("size(true)", CTX)
+        @test evaluate("string(42)", CTX) == "42"
+        @test evaluate("string(-1)", CTX) == "-1"
+        @test evaluate("string(bindings.big)", CTX) == "18446744073709551615"
+        @test evaluate("string(3.5)", CTX) == "3.5"
+        @test evaluate("string(true)", CTX) == "true"
+        @test evaluate("string('s')", CTX) == "s"
+        @test_throws CELEvalError evaluate("string(null)", CTX)
+        @test evaluate("int('42')", CTX) === Int64(42)
+        @test evaluate("int(3.9)", CTX) === Int64(3)             # truncation toward zero
+        @test evaluate("int(0.0 - 3.9)", CTX) === Int64(-3)
+        @test evaluate("int(bindings.big / bindings.big)", CTX) === Int64(1)
+        @test_throws CELEvalError evaluate("int(bindings.big)", CTX)   # out of range
+        @test_throws CELEvalError evaluate("int(9223372036854775808.0)", CTX)
+        @test_throws CELEvalError evaluate("int('abc')", CTX)
+        @test_throws CELEvalError evaluate("int(true)", CTX)
+        @test evaluate("uint(5)", CTX) === UInt64(5)
+        @test evaluate("uint('7')", CTX) === UInt64(7)
+        @test evaluate("uint(3.9)", CTX) === UInt64(3)
+        @test_throws CELEvalError evaluate("uint(0 - 1)", CTX)
+        @test_throws CELEvalError evaluate("uint(18446744073709551616.0)", CTX)
+        @test evaluate("double(1)", CTX) === 1.0
+        @test evaluate("double('3.5')", CTX) === 3.5
+        @test evaluate("double(bindings.big)", CTX) === 1.8446744073709552e19
+        @test_throws CELEvalError evaluate("double('x')", CTX)
+        # arity and unknown functions refuse at compile time
+        @test_throws CELParseError CEL.compile("size()")
+        @test_throws CELParseError CEL.compile("size(1, 2)")
+        @test_throws CELParseError CEL.compile("frobnicate(1)")
+        @test_throws CELParseError CEL.compile("type(1)")        # type(): unimplemented
+    end
+
+    @testset "has" begin
+        @test evaluate_bool("has(identity.device_id)", CTX)
+        @test !evaluate_bool("has(identity.nosuchfield)", CTX)   # absent: false, no error
+        @test !evaluate_bool("has(labels.missing)", CTX)
+        @test evaluate_bool("has(labels.zone) && labels.zone == 'A'", CTX)
+        # the base object must still resolve, and must be a map
+        @test_throws CELEvalError evaluate("has(nosuchvar.f)", CTX)
+        @test_throws CELEvalError evaluate("has(identity.device_id.f)", CTX)
+        # has() is a macro: anything but a field selection refuses to compile
+        @test_throws CELParseError CEL.compile("has(labels)")
+        @test_throws CELParseError CEL.compile("has(1)")
+        @test_throws CELParseError CEL.compile("has(labels['zone'])")
+        @test_throws CELParseError CEL.compile("has(labels.zone, 1)")
+    end
+
+    @testset "matches" begin
+        @test evaluate_bool("'hello'.matches('^h.*o\$')", CTX)
+        @test evaluate_bool("'hello'.matches('ell')", CTX)       # unanchored
+        @test !evaluate_bool("'hello'.matches('^ell')", CTX)
+        @test evaluate_bool("matches('hello', 'h[ae]llo')", CTX)
+        @test !evaluate_bool("matches('hello', 'world')", CTX)
+        @test evaluate_bool("identity.device_type.matches('camera/.+')", CTX)
+        @test_throws CELEvalError evaluate("'a'.matches('(')", CTX)   # bad pattern
+        @test_throws CELEvalError evaluate("matches(1, 'x')", CTX)
+        @test_throws CELEvalError evaluate("'a'.matches(1)", CTX)
+        @test_throws CELParseError CEL.compile("matches('a')")   # arity
+    end
+
+    @testset "comprehensions" begin
+        procs = Dict{String,Any}("procedures" =>
+            Any[Dict{String,Any}("name" => "echo", "labels" => Dict{String,Any}())])
+        @test evaluate_bool("procedures.exists(p, p.name == \"echo\")", procs)
+        @test evaluate_bool("size(procedures) > 0", procs)
+        @test !evaluate_bool("procedures.exists(p, p.name == \"nope\")", procs)
+        @test evaluate_bool("[1, 2, 3].exists(x, x > 2)", CTX)
+        @test !evaluate_bool("[].exists(x, true)", CTX)
+        @test evaluate_bool("[1, 2, 3].all(x, x > 0)", CTX)
+        @test !evaluate_bool("[1, 2, 3].all(x, x > 1)", CTX)
+        @test evaluate_bool("[].all(x, false)", CTX)             # vacuous truth
+        @test evaluate_bool("[1, 2, 3].exists_one(x, x == 2)", CTX)
+        @test !evaluate_bool("[1, 2, 2].exists_one(x, x == 2)", CTX)
+        @test !evaluate_bool("[].exists_one(x, true)", CTX)
+        @test evaluate("[1, 2, 3, 4].filter(x, x % 2 == 0)", CTX) == Any[2, 4]
+        @test evaluate("[1, 2].map(x, x * 10)", CTX) == Any[10, 20]
+        @test evaluate("[].map(x, nosuchvar)", CTX) == Any[]
+        # comprehensions over a map iterate its keys
+        @test evaluate_bool("labels.exists(k, k == 'zone')", CTX)
+        @test evaluate_bool("labels.all(k, size(k) > 3)", CTX)
+        @test evaluate("labels.filter(k, k == 'zone')", CTX) == Any["zone"]
+        # nesting and shadowing
+        @test evaluate_bool("[[1], [2]].exists(x, x.exists(y, y == 2))", CTX)
+        @test evaluate("[1].map(x, [10].map(x, x))[0][0]", CTX) == 10
+        @test evaluate("[1].map(x, x)[0]", Dict{String,Any}("x" => 99)) == 1
+        @test evaluate("[1].map(y, x + y)[0]", Dict{String,Any}("x" => 99)) == 100
+        # error absorption (cel-spec): exists absorbs once a true is
+        # found, all once a false is found; otherwise the error propagates
+        @test evaluate_bool("['a', 1].exists(x, x > 0)", CTX)
+        @test !evaluate_bool("['a', 1].all(x, x > 1)", CTX)
+        @test_throws CELEvalError evaluate("['a', 1].exists(x, x > 1)", CTX)
+        @test_throws CELEvalError evaluate("['a', 2].all(x, x > 1)", CTX)
+        # exists_one / filter / map propagate any error
+        @test_throws CELEvalError evaluate("['a', 1].exists_one(x, x > 0)", CTX)
+        @test_throws CELEvalError evaluate("['a', 1].filter(x, x > 0)", CTX)
+        @test_throws CELEvalError evaluate("[1, 'a'].map(x, x * 2)", CTX)
+        # a non-bool predicate is an error
+        @test_throws CELEvalError evaluate("[1].exists(x, x)", CTX)
+        # comprehensions need a list or a map
+        @test_throws CELEvalError evaluate("status.battery.exists(x, true)", CTX)
+        @test_throws CELEvalError evaluate("'abc'.exists(x, true)", CTX)
+        # the loop variable must be a plain identifier
+        @test_throws CELParseError CEL.compile("[1].exists(1, true)")
+        @test_throws CELParseError CEL.compile("[1].exists(true, true)")
+        @test_throws CELParseError CEL.compile("[1].exists(x.y, true)")
+        @test_throws CELParseError CEL.compile("[1].exists(x)")
+        # timeouts inside comprehensions are never absorbed
+        @test_throws CELEvalError evaluate_bool("[1].exists(x, true)", CTX;
+                                                timeout=-1.0)
+    end
+
     @testset "error absorption in && / ||" begin
         # A missing member errors, but the other arm decides.
         @test evaluate_bool("labels.missing == \"x\" || labels.zone == \"A\"", CTX)
@@ -82,11 +327,12 @@ const CTX = Dict{String,Any}(
 
     @testset "compile errors" begin
         @test_throws CELParseError CEL.compile("")
-        @test_throws CELParseError CEL.compile("1 + 1")            # arithmetic: unsupported
+        @test_throws CELParseError CEL.compile("1 | 2")            # outside the subset
         @test_throws CELParseError CEL.compile("a ?? b")
         @test_throws CELParseError CEL.compile("labels.zone ==")
+        @test_throws CELParseError CEL.compile("1 +")
         @test_throws CELParseError CEL.compile("'unterminated")
-        @test_throws CELParseError CEL.compile("s.matches('x')")   # unsupported method
+        @test_throws CELParseError CEL.compile("s.frobnicate('x')") # unsupported method
         @test_throws CELParseError CEL.compile("99999999999999999999999999")
         @test_throws CELParseError CEL.compile("(" ^ 100 * "true" * ")" ^ 100)
         @test_throws CELParseError CEL.compile("true false")       # trailing input
