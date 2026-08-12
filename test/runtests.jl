@@ -214,6 +214,22 @@ const CTX = Dict{String,Any}(
         @test evaluate("double('3.5')", CTX) === 3.5
         @test evaluate("double(bindings.big)", CTX) === 1.8446744073709552e19
         @test_throws CELEvalError evaluate("double('x')", CTX)
+        # bool(): identity + the cel-spec ten-token string set (conversions).
+        @test evaluate("bool(true)", CTX) === true
+        for t in ("1", "t", "true", "TRUE", "True")
+            @test evaluate("bool('$t')", CTX) === true
+        end
+        for f in ("0", "f", "false", "FALSE", "False")
+            @test evaluate("bool('$f')", CTX) === false
+        end
+        @test_throws CELEvalError evaluate("bool('TrUe')", CTX)   # mixed case
+        @test_throws CELEvalError evaluate("bool('yes')", CTX)
+        @test_throws CELEvalError evaluate("bool(1)", CTX)        # only bool/string
+        # dyn(): a runtime no-op (identity); accepted so conformant
+        # expressions written for a checked environment compile.
+        @test evaluate("dyn(5)", CTX) === Int64(5)
+        @test evaluate_bool("dyn([1, 2]) == [1, 2]", CTX)
+        @test evaluate("dyn('x')", CTX) == "x"
         # arity and unknown functions refuse at compile time
         @test_throws CELParseError CEL.compile("size()")
         @test_throws CELParseError CEL.compile("size(1, 2)")
@@ -247,6 +263,21 @@ const CTX = Dict{String,Any}(
         @test_throws CELEvalError evaluate("matches(1, 'x')", CTX)
         @test_throws CELEvalError evaluate("'a'.matches(1)", CTX)
         @test_throws CELParseError CEL.compile("matches('a')")   # arity
+        # matches() runs on RE2.jl: cel-spec pins it to the RE2 subset, so a
+        # PCRE-only construct is a fail-closed CELEvalError -- NOT a silent
+        # match (the old PCRE backing would have accepted these).
+        @test_throws CELEvalError evaluate("'aa'.matches('(a)\\\\1')", CTX)   # backref
+        @test_throws CELEvalError evaluate("'ab'.matches('a(?=b)')", CTX)     # lookahead
+        @test_throws CELEvalError evaluate("'ab'.matches('(?<=a)b')", CTX)    # lookbehind
+        # in-subset RE2 features work
+        @test evaluate_bool("'HELLO'.matches('(?i)hello')", CTX)
+        @test evaluate_bool("'the grey cat'.matches('gr(a|e)y')", CTX)
+        # a hostile predicate cannot become a denial of service: the
+        # linear-time engine bounds what would blow up a backtracker.
+        let s = "a"^60 * "c"
+            t = @elapsed evaluate_bool("'$s'.matches('(a+)+b')", CTX)
+            @test t < 0.5
+        end
     end
 
     @testset "comprehensions" begin

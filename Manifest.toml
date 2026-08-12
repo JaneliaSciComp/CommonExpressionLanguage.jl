@@ -1,7 +1,12 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.10.10"
+julia_version = "1.11.9"
 manifest_format = "2.0"
-project_hash = "16ff0c1a6862bf6aad8a479785100945f8d51791"
+project_hash = "ffce54fe1afa9fec2779ba71b7fc4375528346f1"
 
-[deps]
+[[deps.RE2]]
+git-tree-sha1 = "b5c2db5d884f202205ec4ce6ba0be08e29f4ebb6"
+repo-rev = "master"
+repo-url = "https://github.com/JaneliaSciComp/RE2.jl.git"
+uuid = "12f3e788-2c80-41f9-80e4-0c59f1c81de7"
+version = "0.1.0"

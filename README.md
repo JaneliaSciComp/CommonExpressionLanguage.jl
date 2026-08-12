@@ -39,7 +39,8 @@ primary  := literal | ident | func '(' expr (',' expr)* ')'
 literal  := string | number | 'true' | 'false' | 'null'
 method   := 'startsWith' | 'endsWith' | 'contains' | 'matches'
 macro    := 'exists' | 'all' | 'exists_one' | 'filter' | 'map'
-func     := 'size' | 'has' | 'string' | 'int' | 'uint' | 'double' | 'matches'
+func     := 'size' | 'has' | 'string' | 'int' | 'uint' | 'double'
+          | 'bool' | 'dyn' | 'matches'
 ```
 
 Anything outside the subset **fails to compile** (`CELParseError`), never
@@ -70,9 +71,14 @@ fail-closed policy.
   error. Map comprehensions iterate **keys**.
 - The ternary evaluates only the taken branch and requires a `bool`
   condition.
-- `matches` uses Julia's PCRE, a strict **superset** of cel-spec's RE2
-  subset: every conformant pattern works, but PCRE-only constructs
-  (backreferences, lookaround) are accepted where RE2 would reject them.
+- `matches` runs on [RE2.jl](https://github.com/JaneliaSciComp/RE2.jl), a
+  native-Julia **linear-time** RE2-subset engine. cel-spec pins `matches()`
+  to RE2 syntax *and* to a polynomial cost bound (part of CEL's terminating
+  guarantee); an automaton engine meets both. A PCRE-only construct
+  (backreference, lookaround, atomic/possessive group) is a fail-closed
+  `CELEvalError`, exactly as under RE2, and matching cannot
+  catastrophically backtrack — a hostile pattern or input cannot become a
+  denial of service.
 - `&&`/`||` are **commutative over errors**: an errored arm is absorbed
   when the other arm alone decides the result (false decides `&&`, true
   decides `||`); otherwise the error propagates.

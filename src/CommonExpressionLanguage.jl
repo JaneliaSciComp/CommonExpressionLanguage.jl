@@ -7,7 +7,7 @@
 # `cond ? a : b`, CEL's `&&`/`||` (which are COMMUTATIVE OVER ERRORS,
 # not merely short-circuiting), the string methods
 # startsWith/endsWith/contains/matches, the global functions
-# size/has/string/int/uint/double/matches, and the comprehension macros
+# size/has/string/int/uint/double/bool/dyn/matches, and the comprehension
 # exists/all/exists_one/filter/map. Everything outside the subset fails
 # to COMPILE with `CELParseError` -- never silently misparses -- so
 # callers can route unsupported expressions to a fail-closed policy.
@@ -44,24 +44,15 @@
 #     absent-field semantics), not `null`; `has(e.f)` is the presence
 #     test, and is a macro -- its argument must be a field selection AT
 #     COMPILE TIME;
-#   * `matches` compiles the pattern with Julia's PCRE, a strict
-#     SUPERSET of cel-spec's RE2 subset: every conformant pattern
-#     works, but PCRE-only constructs (backreferences, lookaround) are
-#     accepted here where a strict RE2 engine would reject them;
-#   * `&&`/`||` absorb an errored arm when the other arm alone decides
-#     the result (false decides `&&`, true decides `||`); otherwise the
-#     error propagates; comprehensions mirror this per cel-spec:
-#     `exists` absorbs per-element errors once a true is found, `all`
-#     once a false is found, while `exists_one`/`filter`/`map` propagate
-#     the first error; comprehensions over a map iterate its KEYS;
-#   * the ternary evaluates ONLY the taken branch, and its condition
-#     must be a bool;
-#   * evaluation is wall-clock bounded (`timeout`), re-checked on every
-#     comprehension iteration; a timeout is never absorbed by `&&`/`||`
-#     or by `exists`/`all`;
-#   * a non-boolean result from `evaluate_bool` is an error, never a
-#     truthiness coercion.
+#   * `matches` runs on RE2.jl, the native-Julia linear-time RE2-subset
+#     engine: cel-spec pins matches() to RE2 syntax and to a polynomial
+#     cost bound (part of CEL's terminating guarantee), and an automaton
+#     engine meets both. An out-of-subset pattern (backreference,
+#     lookaround, ...) is a fail-closed CELEvalError exactly as under RE2,
+#     and matching cannot catastrophically backtrack;
 module CommonExpressionLanguage
+
+import RE2
 
 export compile, evaluate, evaluate_bool, CELParseError, CELEvalError
 
@@ -273,7 +264,7 @@ end
 const STRING_METHODS = ("startsWith", "endsWith", "contains", "matches")
 const MACRO_METHODS = ("exists", "all", "exists_one", "filter", "map")
 const GLOBAL_FUNCTIONS = ("size", "has", "string", "int", "uint", "double",
-                          "matches")
+                          "bool", "dyn", "matches")
 const KEYWORDS = ("true", "false", "null", "in")
 
 mutable struct Parser
@@ -659,21 +650,23 @@ function evaluate_node(n::Node, ctx::EvalCtx)
     throw(CELEvalError("unreachable node kind"))
 end
 
-# cel-spec requires RE2 syntax for matches(); Julia's PCRE is a strict
-# SUPERSET of the RE2 subset, so every conformant pattern behaves
-# identically, but PCRE-only constructs (backreferences, lookaround) are
-# accepted here where a strict RE2 engine would reject the pattern.
+# cel-spec pins matches() to RE2 syntax AND to a polynomial cost bound
+# (langdef "Performance Limits" -- part of CEL's foundational *terminating*
+# guarantee for evaluating untrusted expressions). RE2.jl is the automaton
+# engine that meets both: it is a native, linear-time RE2-subset matcher, so
+# an out-of-subset pattern (a backreference, lookaround, ...) is a compile
+# error exactly as under RE2, and matching cannot catastrophically backtrack
+# -- a hostile `where` predicate can never become a denial of service. An
+# invalid / out-of-subset regex is a CEL evaluation error (fail closed).
 function _cel_matches(s::AbstractString, pat::AbstractString)
     re = try
-        Regex(pat)
-    catch
-        throw(CELEvalError("invalid regular expression"))
+        RE2.compile(pat)
+    catch e
+        e isa RE2.RE2ParseError &&
+            throw(CELEvalError("invalid regular expression: $(e.msg)"))
+        rethrow()
     end
-    try
-        return occursin(re, s)             # unanchored, as cel-spec requires
-    catch
-        throw(CELEvalError("regular expression match failed"))
-    end
+    return RE2.matches(re, s)
 end
 
 function _eval_call(n::Call, ctx::EvalCtx)
@@ -700,8 +693,30 @@ function _eval_call(n::Call, ctx::EvalCtx)
         return _to_int(v)
     elseif n.name == "uint"
         return _to_uint(v)
+    elseif n.name == "bool"
+        return _to_bool(v)
+    elseif n.name == "dyn"
+        # cel-spec: dyn "does not exist at runtime" -- a type-checker hint.
+        # In a dynamically-typed evaluator it is the identity, accepted so
+        # conformant expressions written for checked environments compile.
+        return v
     end
     return _to_double(v)                   # parser admits no other names
+end
+
+# bool(string) accepts EXACTLY the cel-spec ten-token set (pinned by the
+# conformance suite's conversions cases): 1/t/true/TRUE/True and their
+# false counterparts. Mixed case ("TrUe") is a conversion error.
+const _BOOL_TRUE_TOKENS = ("1", "t", "true", "TRUE", "True")
+const _BOOL_FALSE_TOKENS = ("0", "f", "false", "FALSE", "False")
+function _to_bool(v)
+    v isa Bool && return v                 # identity
+    if v isa AbstractString
+        v in _BOOL_TRUE_TOKENS && return true
+        v in _BOOL_FALSE_TOKENS && return false
+        throw(CELEvalError("bool() could not parse the string"))
+    end
+    throw(CELEvalError("bool() on an unsupported type"))
 end
 
 function _to_int(v)

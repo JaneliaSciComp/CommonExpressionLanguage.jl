@@ -1,10 +1,17 @@
 name = "CommonExpressionLanguage"
 uuid = "504a643d-8012-417d-96de-56a510ca6d29"
 authors = ["Ben Arthur <arthurb@hhmi.org>"]
-version = "0.1.0"
+version = "0.2.0"
+
+[deps]
+RE2 = "12f3e788-2c80-41f9-80e4-0c59f1c81de7"
+
+[sources]
+RE2 = {url = "https://github.com/JaneliaSciComp/RE2.jl.git"}
 
 [compat]
-julia = "1.10"
+RE2 = "0.1"
+julia = "1.11"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
