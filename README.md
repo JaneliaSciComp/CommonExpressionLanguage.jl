@@ -2,7 +2,8 @@
 
 A native-Julia evaluator for a subset of the
 [Common Expression Language](https://cel.dev) (CEL) — no wrapping of
-cel-go/cel-cpp/cel-c, no binary dependencies, no deps at all.
+cel-go/cel-cpp/cel-c, and no dependencies beyond the libpcre2 that
+ships inside every Julia (the PCRE2_jll stdlib, used by `matches`).
 
 ```julia
 using CommonExpressionLanguage
@@ -71,14 +72,23 @@ fail-closed policy.
   error. Map comprehensions iterate **keys**.
 - The ternary evaluates only the taken branch and requires a `bool`
   condition.
-- `matches` runs on [RE2.jl](https://github.com/JaneliaSciComp/RE2.jl), a
-  native-Julia **linear-time** RE2-subset engine. cel-spec pins `matches()`
-  to RE2 syntax *and* to a polynomial cost bound (part of CEL's terminating
-  guarantee); an automaton engine meets both. A PCRE-only construct
-  (backreference, lookaround, atomic/possessive group) is a fail-closed
-  `CELEvalError`, exactly as under RE2, and matching cannot
-  catastrophically backtrack — a hostile pattern or input cannot become a
-  denial of service.
+- `matches` runs on libpcre2's **non-backtracking DFA matcher**
+  (`pcre2_dfa_match`, the same algorithm family as RE2), via the PCRE2_jll
+  stdlib that ships inside every Julia. cel-spec pins `matches()` to RE2
+  syntax *and* to a polynomial cost bound (part of CEL's terminating
+  guarantee); the DFA meets the cost bound, and a compile-time screen
+  enforces the syntax: a PCRE-only construct (backreference, lookaround,
+  atomic/possessive group, `\Z`, …) is a fail-closed `CELEvalError`
+  exactly as under RE2 — crucial because the DFA matcher would otherwise
+  silently *match* lookarounds. The screen also rewrites the escapes whose
+  meaning differs (`\v`, `\s`, `\S`, octal, non-multiline `$`, `(?m)^`) to
+  spellings with the RE2 meaning, a mapping fuzz-verified against the real
+  C++ RE2 (hundreds of thousands of pattern/subject checks, zero
+  disagreements; the one accepted divergence is `\b`/`\B` *inside* a
+  multi-byte character, where C++ RE2's byte-level automaton can assert
+  but a codepoint-level matcher cannot). Matching cannot catastrophically
+  backtrack — a hostile pattern or input cannot become a denial of
+  service.
 - `&&`/`||` are **commutative over errors**: an errored arm is absorbed
   when the other arm alone decides the result (false decides `&&`, true
   decides `||`); otherwise the error propagates.

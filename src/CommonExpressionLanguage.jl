@@ -44,15 +44,16 @@
 #     absent-field semantics), not `null`; `has(e.f)` is the presence
 #     test, and is a macro -- its argument must be a field selection AT
 #     COMPILE TIME;
-#   * `matches` runs on RE2.jl, the native-Julia linear-time RE2-subset
-#     engine: cel-spec pins matches() to RE2 syntax and to a polynomial
-#     cost bound (part of CEL's terminating guarantee), and an automaton
-#     engine meets both. An out-of-subset pattern (backreference,
-#     lookaround, ...) is a fail-closed CELEvalError exactly as under RE2,
-#     and matching cannot catastrophically backtrack;
+#   * `matches` runs on libpcre2's non-backtracking DFA matcher (the
+#     PCRE2_jll stdlib that ships inside every Julia): cel-spec pins
+#     matches() to RE2 syntax and to a polynomial cost bound (part of
+#     CEL's terminating guarantee). A compile-time screen enforces the
+#     RE2 subset -- an out-of-subset pattern (backreference, lookaround,
+#     ...) is a fail-closed CELEvalError exactly as under RE2 -- and the
+#     DFA algorithm cannot catastrophically backtrack;
 module CommonExpressionLanguage
 
-import RE2
+using PCRE2_jll: libpcre2_8
 
 export compile, evaluate, evaluate_bool, CELParseError, CELEvalError
 
@@ -652,21 +653,414 @@ end
 
 # cel-spec pins matches() to RE2 syntax AND to a polynomial cost bound
 # (langdef "Performance Limits" -- part of CEL's foundational *terminating*
-# guarantee for evaluating untrusted expressions). RE2.jl is the automaton
-# engine that meets both: it is a native, linear-time RE2-subset matcher, so
-# an out-of-subset pattern (a backreference, lookaround, ...) is a compile
-# error exactly as under RE2, and matching cannot catastrophically backtrack
-# -- a hostile `where` predicate can never become a denial of service. An
-# invalid / out-of-subset regex is a CEL evaluation error (fail closed).
-function _cel_matches(s::AbstractString, pat::AbstractString)
-    re = try
-        RE2.compile(pat)
-    catch e
-        e isa RE2.RE2ParseError &&
-            throw(CELEvalError("invalid regular expression: $(e.msg)"))
-        rethrow()
+# guarantee for evaluating untrusted expressions). Both are met by libpcre2's
+# ALTERNATIVE matcher, pcre2_dfa_match(): a non-backtracking NFA simulation
+# (the same algorithm family as RE2), shipped with every Julia via the
+# PCRE2_jll stdlib. PCRE2 alone is not enough, though -- it accepts a
+# superset of RE2 syntax, and the DFA matcher silently *matches* lookaround /
+# atomic-group / possessive patterns that RE2 must reject at compile time,
+# while a few escapes mean different things in the two engines. So every
+# pattern first goes through _re2_to_pcre2(): a single pass that rejects
+# everything outside the RE2 subset (fail closed, CELEvalError) and rewrites
+# the divergent escapes to spellings with the RE2 meaning:
+#   * RE2 `\v` is the vertical-tab CHARACTER, PCRE2 `\v` a whitespace class
+#     -> rewritten to \x0B;
+#   * RE2 `\s` is [\t\n\f\r ] (no VT), PCRE2 `\s` includes VT -> expanded;
+#     `\S` is the mirrored complement;
+#   * octal escapes are valid RE2 but heuristically read as BACKREFERENCES
+#     by PCRE2 -> rewritten to \x{...}; a lone \1..\9 (an RE2 backreference
+#     error) is rejected;
+#   * `\Z` and `$`-before-trailing-newline are PCRE2-isms: \Z is rejected,
+#     and a `$` outside (?m) scope is rewritten to \z (true end-of-text,
+#     the RE2 meaning; PCRE2's DOLLAR_ENDONLY option would express this
+#     but is unreliable under the DFA matcher with inline (?m)).
+# One known, accepted divergence: C++ RE2 runs a byte-level automaton, so
+# \b/\B are evaluated between BYTES and \B can match inside a multi-byte
+# character (both its bytes being non-word); PCRE2 in UTF mode evaluates
+# them between CODEPOINTS and never sees that position. They agree on all
+# ASCII text.
+
+_re2_err(msg) = throw(CELEvalError("invalid regular expression: " * msg))
+
+# RE2 \s is [\t\n\f\r ]; PCRE2-\S ∪ {VT} equals RE2-\S.
+const _RE2_SPACE_IN_CLASS = "\\t\\n\\f\\r "
+const _RE2_NONSPACE_IN_CLASS = "\\S\\x0B"
+
+_re2_ishex(c::Char) = c in '0':'9' || c in 'a':'f' || c in 'A':'F'
+
+# Handles one escape starting at cs[i] == '\\' (cs[i+1] exists). Writes the
+# PCRE2 spelling of the RE2 meaning; returns the index just past the escape.
+function _re2_escape!(out::IOBuffer, cs::Vector{Char}, i::Int, in_class::Bool)
+    n = length(cs)
+    c = cs[i+1]
+    if c in ('a', 'f', 'n', 'r', 't') || c in ('d', 'D', 'w', 'W')
+        write(out, '\\', c)                # identical meaning (ASCII classes)
+        return i + 2
+    elseif c == 'v'
+        write(out, "\\x0B")
+        return i + 2
+    elseif c == 's'
+        in_class ? write(out, _RE2_SPACE_IN_CLASS) :
+                   write(out, '[', _RE2_SPACE_IN_CLASS, ']')
+        return i + 2
+    elseif c == 'S'
+        in_class ? write(out, _RE2_NONSPACE_IN_CLASS) :
+                   write(out, '[', _RE2_NONSPACE_IN_CLASS, ']')
+        return i + 2
+    elseif c in ('b', 'B', 'A', 'z', 'C')  # assertions + any-byte \C
+        in_class && _re2_err("\\$c is not valid inside a character class")
+        write(out, '\\', c)
+        return i + 2
+    elseif c == 'p' || c == 'P'            # Unicode properties: shared syntax
+        i + 2 > n && _re2_err("incomplete \\$c escape")
+        if cs[i+2] == '{'
+            j = i + 3
+            while j <= n && cs[j] != '}'
+                j += 1
+            end
+            j > n && _re2_err("missing } in \\$c{...}")
+            foreach(k -> write(out, cs[k]), i:j)
+            return j + 1
+        end
+        write(out, '\\', c, cs[i+2])
+        return i + 3
+    elseif c == 'x'
+        i + 2 > n && _re2_err("incomplete \\x escape")
+        if cs[i+2] == '{'
+            j = i + 3
+            nhex = 0
+            while j <= n && cs[j] != '}'
+                _re2_ishex(cs[j]) || _re2_err("bad hex digit in \\x{...}")
+                nhex += 1
+                j += 1
+            end
+            (j > n || nhex == 0) && _re2_err("malformed \\x{...}")
+            foreach(k -> write(out, cs[k]), i:j)
+            return j + 1
+        end
+        (i + 3 <= n && _re2_ishex(cs[i+2]) && _re2_ishex(cs[i+3])) ||
+            _re2_err("\\x needs exactly two hex digits or {...}")  # RE2 rule
+        write(out, "\\x", cs[i+2], cs[i+3])
+        return i + 4
+    elseif c == 'Q'                        # \Q...\E literal text: verbatim
+        j = i + 2
+        while j < n && !(cs[j] == '\\' && cs[j+1] == 'E')
+            j += 1
+        end
+        stop = j < n ? j + 1 : n           # \Q to end-of-pattern is allowed
+        foreach(k -> write(out, cs[k]), i:stop)
+        return stop + 1
+    elseif c == 'E'                        # stray \E: ignored by both engines
+        write(out, "\\E")
+        return i + 2
+    elseif isdigit(c)
+        # RE2: \0 starts an octal escape, \1-\7 are octal only when another
+        # octal digit follows (a LONE \1 is a backreference: unsupported),
+        # \8 \9 are invalid.
+        (c == '8' || c == '9') && _re2_err("invalid escape \\$c")
+        j = i + 1
+        val = 0
+        while j <= n && cs[j] in '0':'7' && j - i <= 3
+            val = val * 8 + (cs[j] - '0')
+            j += 1
+        end
+        (c != '0' && j == i + 2) && _re2_err("backreferences are not supported")
+        write(out, "\\x{", string(val, base = 16), "}")
+        return j
+    elseif isascii(c) && !(isletter(c) || isdigit(c))
+        write(out, '\\', c)   # identity escape: any ASCII non-alnum (RE2 rule)
+        return i + 2
+    else
+        _re2_err("unsupported escape \\$c")
     end
-    return RE2.matches(re, s)
+end
+
+# Validates a group opening at cs[i] == '('. RE2 allows plain, (?:, named
+# ((?P<name>...) / (?<name>...)), and flag groups over [imsU]; everything
+# else PCRE2 understands here (lookaround, atomic groups, conditionals,
+# recursion, comments, (*VERB) controls) is outside the RE2 subset.
+# `mstack` tracks the multiline flag through group scopes so that `$` can be
+# rewritten (see _re2_to_pcre2); its top is the state of the current scope.
+function _re2_group!(out::IOBuffer, cs::Vector{Char}, i::Int,
+                     mstack::Vector{Bool})
+    n = length(cs)
+    i + 1 <= n && cs[i+1] == '*' && _re2_err("(*...) verbs are not supported")
+    if i + 1 > n || cs[i+1] != '?'
+        push!(mstack, mstack[end])
+        write(out, '(')
+        return i + 1
+    end
+    i + 2 > n && _re2_err("dangling (?")
+    c = cs[i+2]
+    if c == ':'
+        push!(mstack, mstack[end])
+        write(out, "(?:")
+        return i + 3
+    elseif c == '=' || c == '!'
+        _re2_err("lookahead assertions are not supported")
+    elseif c == '<' && i + 3 <= n && (cs[i+3] == '=' || cs[i+3] == '!')
+        _re2_err("lookbehind assertions are not supported")
+    elseif c == '>'
+        _re2_err("atomic groups are not supported")
+    elseif c == '#'
+        _re2_err("(?#...) comments are not supported")
+    elseif c == '('
+        _re2_err("conditional groups are not supported")
+    elseif c == '\''
+        _re2_err("(?'name'...) groups are not supported")
+    elseif c == 'P' || c == '<'
+        j = i + 3
+        if c == 'P'                        # (?P= and (?P> land in the error
+            (j <= n && cs[j] == '<') ||
+                _re2_err("only (?P<name>...) is supported after (?P")
+            j += 1
+        end
+        d = j
+        while j <= n && isascii(cs[j]) &&
+              (isdigit(cs[j]) || isletter(cs[j]) || cs[j] == '_')
+            j += 1
+        end
+        (j > d && j <= n && cs[j] == '>') ||
+            _re2_err("malformed capture group name")
+        push!(mstack, mstack[end])
+        foreach(k -> write(out, cs[k]), i:j)
+        return j + 1
+    else                                   # flag group: (?imsU-imsU[:)]
+        j = i + 2
+        seen_dash = false
+        newm = mstack[end]
+        while j <= n
+            cj = cs[j]
+            if cj in ('i', 'm', 's', 'U')
+                cj == 'm' && (newm = !seen_dash)
+                j += 1
+            elseif cj == '-' && !seen_dash
+                seen_dash = true
+                j += 1
+            elseif cj == ':' || cj == ')'
+                j == i + 2 && _re2_err("malformed (?...) group")
+                if cj == ':'
+                    push!(mstack, newm)    # (?flags:...): scoped to the group
+                else
+                    mstack[end] = newm     # (?flags): to end of enclosing scope
+                end
+                foreach(k -> write(out, cs[k]), i:j)
+                return j + 1
+            else
+                _re2_err("unsupported (?...) group or flag")
+            end
+        end
+        _re2_err("unterminated (?...) group")
+    end
+end
+
+function _re2_to_pcre2(pat::String)
+    all(isvalid, pat) || _re2_err("pattern is not valid UTF-8")
+    cs = collect(pat)
+    n = length(cs)
+    out = IOBuffer()
+    i = 1
+    in_class = false
+    prev_quant = false     # last token was a quantifier: possessive detection
+    mstack = Bool[false]   # multiline-flag scope stack (top = current scope)
+    while i <= n
+        c = cs[i]
+        if c == '\\'
+            i == n && _re2_err("trailing backslash")
+            i = _re2_escape!(out, cs, i, in_class)
+            prev_quant = false
+        elseif in_class
+            if c == ']'
+                in_class = false
+                write(out, c)
+                i += 1
+            elseif c == '[' && i < n && cs[i+1] in (':', '.', '=')
+                cs[i+1] == ':' ||
+                    _re2_err("collating [$(cs[i+1])...$(cs[i+1])] classes are not supported")
+                j = i + 2
+                while j < n && !(cs[j] == ':' && cs[j+1] == ']')
+                    j += 1
+                end
+                j >= n && _re2_err("missing closing :] in character class")
+                foreach(k -> write(out, cs[k]), i:j+1)
+                i = j + 2
+            else
+                write(out, c)
+                i += 1
+            end
+        elseif c == '('
+            i = _re2_group!(out, cs, i, mstack)
+            prev_quant = false
+        elseif c == ')'
+            length(mstack) > 1 && pop!(mstack)  # unbalanced ) errors in PCRE2
+            write(out, c)
+            i += 1
+            prev_quant = false
+        elseif c == '$'
+            # RE2 `$` without (?m) is true end-of-text (PCRE2 needs \z for
+            # that; its DOLLAR_ENDONLY option is unreliable under the DFA
+            # matcher when (?m) appears inline, so rewrite instead).
+            write(out, mstack[end] ? "\$" : "\\z")
+            i += 1
+            prev_quant = false
+        elseif c == '^' && mstack[end]
+            # RE2 `(?m)^` also matches after a newline at the very end of the
+            # subject; PCRE2's does not. A length-1 lookbehind (internal
+            # only -- user lookbehinds stay rejected) has the RE2 meaning at
+            # every position, at O(1) cost per position.
+            write(out, "(?:\\A|(?<=\\n))")
+            i += 1
+            prev_quant = false
+        elseif c == '['
+            write(out, c)
+            i += 1
+            if i <= n && cs[i] == '^'
+                write(out, '^')
+                i += 1
+            end
+            if i <= n && cs[i] == ']'  # leading ] is literal in RE2 and PCRE2
+                write(out, ']')
+                i += 1
+            end
+            in_class = true
+            prev_quant = false
+        elseif c == '{'
+            j = i + 1
+            d1 = j
+            while j <= n && isdigit(cs[j]) && j - d1 < 8
+                j += 1
+            end
+            lo = j > d1 ? parse(Int, String(cs[d1:j-1])) : -1
+            hi = lo
+            if lo >= 0 && j <= n && cs[j] == ','
+                j += 1
+                d2 = j
+                while j <= n && isdigit(cs[j]) && j - d2 < 8
+                    j += 1
+                end
+                hi = j > d2 ? parse(Int, String(cs[d2:j-1])) : lo   # {n,}
+            end
+            if lo >= 0 && j <= n && cs[j] == '}'
+                max(lo, hi) > 1000 &&
+                    _re2_err("repetition count above the RE2 limit of 1000")
+                foreach(k -> write(out, cs[k]), i:j)
+                i = j + 1
+                prev_quant = true
+            else
+                write(out, '{')            # not a repeat: literal brace
+                i += 1
+                prev_quant = false
+            end
+        elseif c == '*'
+            write(out, c)
+            i += 1
+            prev_quant = true
+        elseif c == '+'
+            prev_quant && _re2_err("possessive quantifiers are not supported")
+            write(out, c)
+            i += 1
+            prev_quant = true
+        elseif c == '?'
+            write(out, c)
+            i += 1
+            prev_quant = !prev_quant       # x*? is the (supported) lazy form
+        else
+            write(out, c)
+            i += 1
+            prev_quant = false
+        end
+    end
+    in_class && _re2_err("missing closing ]")
+    return String(take!(out))
+end
+
+# --- thin ccalls into libpcre2-8 (the PCRE2_jll stdlib) ---
+
+const _PCRE2_UTF = UInt32(0x00080000)
+const _PCRE2_DUPNAMES = UInt32(0x00000040)        # RE2 allows duplicate names
+const _PCRE2_NEWLINE_LF = UInt32(2)               # RE2 lines end at \n only
+const _PCRE2_ERR_NOMATCH = Cint(-1)
+const _PCRE2_ERR_DFA_WSSIZE = Cint(-43)
+
+function _pcre2_errmsg(code::Cint)
+    buf = Vector{UInt8}(undef, 256)
+    r = ccall((:pcre2_get_error_message_8, libpcre2_8), Cint,
+              (Cint, Ptr{UInt8}, Csize_t), code, buf, length(buf))
+    return r < 0 ? "PCRE2 error $code" : String(buf[1:r])
+end
+
+function _pcre2_compile(pat::String)
+    cctx = ccall((:pcre2_compile_context_create_8, libpcre2_8), Ptr{Cvoid},
+                 (Ptr{Cvoid},), C_NULL)
+    cctx == C_NULL && throw(OutOfMemoryError())
+    errcode = Ref{Cint}(0)
+    erroff = Ref{Csize_t}(0)
+    re = try
+        ccall((:pcre2_set_newline_8, libpcre2_8), Cint,
+              (Ptr{Cvoid}, UInt32), cctx, _PCRE2_NEWLINE_LF)
+        ccall((:pcre2_set_parens_nest_limit_8, libpcre2_8), Cint,
+              (Ptr{Cvoid}, UInt32), cctx, UInt32(1024))  # RE2 has no 250 cap
+        ccall((:pcre2_compile_8, libpcre2_8), Ptr{Cvoid},
+              (Ptr{UInt8}, Csize_t, UInt32, Ref{Cint}, Ref{Csize_t}, Ptr{Cvoid}),
+              pat, ncodeunits(pat), _PCRE2_UTF | _PCRE2_DUPNAMES,
+              errcode, erroff, cctx)
+    finally
+        ccall((:pcre2_compile_context_free_8, libpcre2_8), Cvoid,
+              (Ptr{Cvoid},), cctx)
+    end
+    re == C_NULL && _re2_err(_pcre2_errmsg(errcode[]))
+    return re
+end
+
+function _pcre2_dfa_matches(re::Ptr{Cvoid}, s::String)
+    md = ccall((:pcre2_match_data_create_8, libpcre2_8), Ptr{Cvoid},
+               (UInt32, Ptr{Cvoid}), UInt32(1), C_NULL)
+    md == C_NULL && throw(OutOfMemoryError())
+    mctx = ccall((:pcre2_match_context_create_8, libpcre2_8), Ptr{Cvoid},
+                 (Ptr{Cvoid},), C_NULL)
+    if mctx == C_NULL
+        ccall((:pcre2_match_data_free_8, libpcre2_8), Cvoid, (Ptr{Cvoid},), md)
+        throw(OutOfMemoryError())
+    end
+    ws = Vector{Cint}(undef, 128)
+    local rc::Cint
+    try
+        # belt-and-braces resource caps on top of the linear-time algorithm
+        ccall((:pcre2_set_match_limit_8, libpcre2_8), Cint,
+              (Ptr{Cvoid}, UInt32), mctx, UInt32(1) << 24)
+        ccall((:pcre2_set_depth_limit_8, libpcre2_8), Cint,
+              (Ptr{Cvoid}, UInt32), mctx, UInt32(1) << 20)
+        ccall((:pcre2_set_heap_limit_8, libpcre2_8), Cint,
+              (Ptr{Cvoid}, UInt32), mctx, UInt32(1) << 16)   # KiB -> 64 MiB
+        while true
+            rc = ccall((:pcre2_dfa_match_8, libpcre2_8), Cint,
+                       (Ptr{Cvoid}, Ptr{UInt8}, Csize_t, Csize_t, UInt32,
+                        Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cint}, Csize_t),
+                       re, s, ncodeunits(s), 0, UInt32(0), md, mctx,
+                       ws, length(ws))
+            rc == _PCRE2_ERR_DFA_WSSIZE && length(ws) < (1 << 22) || break
+            resize!(ws, 4 * length(ws))
+        end
+    finally
+        ccall((:pcre2_match_context_free_8, libpcre2_8), Cvoid,
+              (Ptr{Cvoid},), mctx)
+        ccall((:pcre2_match_data_free_8, libpcre2_8), Cvoid, (Ptr{Cvoid},), md)
+    end
+    rc >= 0 && return true
+    rc == _PCRE2_ERR_NOMATCH && return false
+    throw(CELEvalError("regular expression matching failed: " *
+                       _pcre2_errmsg(rc)))
+end
+
+function _cel_matches(s::AbstractString, pat::AbstractString)
+    str = String(s)
+    all(isvalid, str) || throw(CELEvalError("matches() on invalid UTF-8"))
+    re = _pcre2_compile(_re2_to_pcre2(String(pat)))
+    try
+        return _pcre2_dfa_matches(re, str)
+    finally
+        ccall((:pcre2_code_free_8, libpcre2_8), Cvoid, (Ptr{Cvoid},), re)
+    end
 end
 
 function _eval_call(n::Call, ctx::EvalCtx)

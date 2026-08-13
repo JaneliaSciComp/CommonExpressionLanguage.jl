@@ -263,17 +263,53 @@ const CTX = Dict{String,Any}(
         @test_throws CELEvalError evaluate("matches(1, 'x')", CTX)
         @test_throws CELEvalError evaluate("'a'.matches(1)", CTX)
         @test_throws CELParseError CEL.compile("matches('a')")   # arity
-        # matches() runs on RE2.jl: cel-spec pins it to the RE2 subset, so a
-        # PCRE-only construct is a fail-closed CELEvalError -- NOT a silent
-        # match (the old PCRE backing would have accepted these).
+        # cel-spec pins matches() to the RE2 subset, so a PCRE-only construct
+        # is a fail-closed CELEvalError -- NOT a silent match. This matters
+        # doubly under the PCRE2-DFA engine, which would otherwise silently
+        # MATCH lookaround/atomic/possessive patterns: the compile-time
+        # screen must catch them all.
         @test_throws CELEvalError evaluate("'aa'.matches('(a)\\\\1')", CTX)   # backref
         @test_throws CELEvalError evaluate("'ab'.matches('a(?=b)')", CTX)     # lookahead
+        @test_throws CELEvalError evaluate("'ab'.matches('a(?!c)')", CTX)     # neg lookahead
         @test_throws CELEvalError evaluate("'ab'.matches('(?<=a)b')", CTX)    # lookbehind
+        @test_throws CELEvalError evaluate("'ab'.matches('(?>a)b')", CTX)     # atomic
+        @test_throws CELEvalError evaluate("'aa'.matches('a++')", CTX)        # possessive
+        @test_throws CELEvalError evaluate("'aa'.matches('a*+')", CTX)
+        @test_throws CELEvalError evaluate("'aa'.matches('a{1,2}+')", CTX)
+        @test_throws CELEvalError evaluate("'a'.matches('a\\\\Z')", CTX)      # \Z (RE2: only \z)
+        @test_throws CELEvalError evaluate("'a'.matches('\\\\1')", CTX)       # lone backref
+        @test_throws CELEvalError evaluate("'a'.matches('\\\\8')", CTX)       # bad octal
+        @test_throws CELEvalError evaluate("'a'.matches('(?#c)a')", CTX)      # comment
+        @test_throws CELEvalError evaluate("'a'.matches('(*FAIL)')", CTX)     # verb
+        @test_throws CELEvalError evaluate("'a'.matches('(?(1)a)')", CTX)     # conditional
+        @test_throws CELEvalError evaluate("'a'.matches('(?R)')", CTX)        # recursion
+        @test_throws CELEvalError evaluate("'a'.matches('\\\\K')", CTX)       # \K
+        @test_throws CELEvalError evaluate("'a'.matches('\\\\cA')", CTX)      # control escape
+        @test_throws CELEvalError evaluate("'a'.matches('(?x)a b')", CTX)     # x flag
+        @test_throws CELEvalError evaluate("'a'.matches('a{1001}')", CTX)     # RE2 repeat cap
         # in-subset RE2 features work
         @test evaluate_bool("'HELLO'.matches('(?i)hello')", CTX)
         @test evaluate_bool("'the grey cat'.matches('gr(a|e)y')", CTX)
+        @test evaluate_bool("'ab'.matches('(?P<x>a)b')", CTX)                 # named groups
+        @test evaluate_bool("'ab'.matches('(?<x>a)b')", CTX)
+        @test evaluate_bool("'x'.matches('\\\\p{L}')", CTX)                   # Unicode property
+        @test !evaluate_bool("'1'.matches('\\\\p{L}')", CTX)
+        @test evaluate_bool("'q'.matches('[[:alpha:]]')", CTX)                # POSIX class
+        @test evaluate_bool("'A'.matches('\\\\x41')", CTX)                    # hex escape
+        @test evaluate_bool("'A'.matches('\\\\101')", CTX)                    # octal escape
+        @test evaluate_bool("'a+b'.matches('\\\\Qa+b\\\\E')", CTX)            # quoted literal
+        # RE2 semantics pins (divergences from PCRE2 defaults, rewritten by
+        # the screen and verified against the real C++ RE2 in a fuzz gate):
+        @test !evaluate_bool("'a\\n'.matches('a\$')", CTX)     # $ is true end of text
+        @test evaluate_bool("'a'.matches('a\$')", CTX)
+        @test evaluate_bool("'x\\nab'.matches('(?m)^ab\$')", CTX)
+        @test evaluate_bool("'\v'.matches('^\\\\v\$')", CTX)  # \v = VT character
+        @test !evaluate_bool("'\v'.matches('^\\\\s\$')", CTX) # RE2 \s has no VT
+        @test evaluate_bool("'\v'.matches('^\\\\S\$')", CTX)
+        @test evaluate_bool("'\v'.matches('^[\\\\S]\$')", CTX)
+        @test !evaluate_bool("'\v'.matches('^[\\\\s]\$')", CTX)
         # a hostile predicate cannot become a denial of service: the
-        # linear-time engine bounds what would blow up a backtracker.
+        # non-backtracking DFA bounds what would blow up a backtracker.
         let s = "a"^60 * "c"
             t = @elapsed evaluate_bool("'$s'.matches('(a+)+b')", CTX)
             @test t < 0.5
